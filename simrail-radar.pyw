@@ -161,7 +161,7 @@ def default_user_settings():
         "lang": "auto",
         "server": CONFIG["DEFAULT_SERVER"],
         "window_min": CONFIG["DEFAULT_WINDOW_MINUTES"],
-        # Standardmäßig alle DLCs aktiv (Nutzer kann abwählen, was er nicht besitzt)
+        "priority": "balanced",
         "owned_dlcs": [d["id"] for d in DLC_CATALOG],
         "custom_excluded": [],
     }
@@ -817,6 +817,8 @@ def evaluate_single_train(
     player_profiles,
     window_min,
     server_now=None,
+    w_train=1.0,
+    w_disp=1.0,
 ):
     t_no = str(train_obj.get("TrainNoLocal", "")).strip()
     t_points = get_train_relative_route(
@@ -899,8 +901,8 @@ def evaluate_single_train(
 
     total_interactions = len(player_encounters) + len(dispatched_on_route)
     rank_weight = (
-        len(player_encounters) * CONFIG["WEIGHT_PLAYER_TRAIN"]
-        + len(dispatched_on_route) * CONFIG["WEIGHT_DISPATCHER"]
+        len(player_encounters) * w_train
+        + len(dispatched_on_route) * w_disp
     )
 
     return {
@@ -1000,6 +1002,15 @@ def fetch_dashboard_payload(requested_server=None, requested_window=None):
     all_trains = res_trains.get("data", [])
 
     excluded_patterns = build_excluded_patterns(user_settings)
+    priority = user_settings.get("priority", "balanced")
+    if priority == "trains":
+        w_train, w_disp = 2.5, 1.0
+    elif priority == "dispatchers":
+        w_train, w_disp = 1.0, 2.5
+    else:
+        priority = "balanced"
+        w_train, w_disp = 1.0, 1.0
+
     player_trains = []
     bot_trains = []
     tracked_train_obj = None
@@ -1071,6 +1082,8 @@ def fetch_dashboard_payload(requested_server=None, requested_window=None):
                 player_profiles,
                 window_min=window_min,
                 server_now=server_now,
+                w_train=w_train,
+                w_disp=w_disp,
             )
         else:
             active_missing = True
@@ -1086,6 +1099,8 @@ def fetch_dashboard_payload(requested_server=None, requested_window=None):
             player_profiles,
             window_min=window_min,
             server_now=server_now,
+            w_train=w_train,
+            w_disp=w_disp,
         )
         if res and res["total_interactions"] > 0:
             candidates.append(res)
@@ -1101,8 +1116,9 @@ def fetch_dashboard_payload(requested_server=None, requested_window=None):
         "config": {
             "window_min": window_min,
             "refresh_sec": CONFIG["AUTO_REFRESH_SECONDS"],
-            "w_train": CONFIG["WEIGHT_PLAYER_TRAIN"],
-            "w_disp": CONFIG["WEIGHT_DISPATCHER"],
+            "w_train": w_train,
+            "w_disp": w_disp,
+            "priority": priority,
             "lang": user_settings.get("lang", "auto"),
             "owned_dlcs": user_settings.get("owned_dlcs", []),
             "custom_excluded": user_settings.get("custom_excluded", []),
@@ -1420,6 +1436,11 @@ HTML_PAGE = """<!DOCTYPE html>
       <span id="ui-window-unit">Min.</span>
     </div>
     <select id="server-select" onchange="changeServer()"></select>
+    <select id="priority-select" onchange="changePriority()" title="Priorität für Zug-Empfehlungen">
+      <option value="balanced" id="opt-prio-balanced">Fokus: Egal (Ausgewogen)</option>
+      <option value="trains" id="opt-prio-trains">Fokus: Mehr Spieler-Züge</option>
+      <option value="dispatchers" id="opt-prio-dispatchers">Fokus: Mehr Stellwerke (Fdl)</option>
+    </select>
     <button onclick="openDlcModal()" id="btn-dlc">DLCs</button>
     <button onclick="toggleAutoRefresh()" id="btn-auto">Auto-Refresh: AN (30s)</button>
     <button class="btn-primary" onclick="loadData()" id="btn-refresh">Jetzt aktualisieren</button>
@@ -1539,6 +1560,9 @@ HTML_PAGE = """<!DOCTYPE html>
       popupTarget: "Ziel: {t}",
       popupFocus: "Fokus: Zug {no}",
       popupAt: "Bei: {pos}",
+      prioBalanced: "Fokus: Egal (Ausgewogen)",
+      prioTrains: "Fokus: Mehr Spieler-Züge",
+      prioDispatchers: "Fokus: Mehr Stellwerke (Fdl)",
       dlcTitle: "Meine Fahrzeug-DLCs",
       dlcSub: "Hake an, welche DLCs du besitzt. Nicht angehakte Fahrzeuge werden bei den freien Zug-Empfehlungen automatisch ausgeblendet.",
       dlcCustomLabel: "Zusätzliche Fahrzeugfilter (kommagetrennt, optional):",
@@ -1608,6 +1632,9 @@ HTML_PAGE = """<!DOCTYPE html>
       popupTarget: "Cel: {t}",
       popupFocus: "Fokus: Pociąg {no}",
       popupAt: "Lokalizacja: {pos}",
+      prioBalanced: "Priorytet: Obojętnie (Równowaga)",
+      prioTrains: "Priorytet: Więcej pociągów graczy",
+      prioDispatchers: "Priorytet: Więcej nastawni (dyżurni)",
       dlcTitle: "Moje dodatki DLC (Tabor)",
       dlcSub: "Zaznacz posiadane dodatki DLC. Niezaznaczone pojazdy zostaną automatycznie ukryte na liście rekomendacji.",
       dlcCustomLabel: "Dodatkowy filtr pojazdów (oddzielone przecinkami, opcjonalnie):",
@@ -1677,6 +1704,9 @@ HTML_PAGE = """<!DOCTYPE html>
       popupTarget: "Destination: {t}",
       popupFocus: "Focus: Train {no}",
       popupAt: "At: {pos}",
+      prioBalanced: "Focus: Balanced (Equal)",
+      prioTrains: "Focus: More Player Trains",
+      prioDispatchers: "Focus: More Signal Boxes",
       dlcTitle: "My Owned Rolling Stock DLCs",
       dlcSub: "Check the DLCs you own. Unchecked vehicles will automatically be hidden from free train recommendations.",
       dlcCustomLabel: "Additional vehicle filter (comma-separated, optional):",
@@ -1746,6 +1776,9 @@ HTML_PAGE = """<!DOCTYPE html>
     document.getElementById('dlc-custom-label').innerText = t('dlcCustomLabel');
     document.getElementById('btn-dlc-cancel').innerText = t('cancel');
     document.getElementById('btn-dlc-save').innerText = t('save');
+    document.getElementById('opt-prio-balanced').innerText = t('prioBalanced');
+    document.getElementById('opt-prio-trains').innerText = t('prioTrains');
+    document.getElementById('opt-prio-dispatchers').innerText = t('prioDispatchers');
     document.getElementById('btn-auto').innerText = autoRefresh
       ? t('autoOn', { s: countdown })
       : t('autoPause');
@@ -1843,6 +1876,16 @@ HTML_PAGE = """<!DOCTYPE html>
   function changeServer() {
     currentServer = document.getElementById('server-select').value;
     focusedTrain = null;
+    loadData();
+  }
+
+  async function changePriority() {
+    const prio = document.getElementById('priority-select').value;
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority: prio })
+    });
     loadData();
   }
 
@@ -2006,6 +2049,12 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     sel.value = data.server;
     currentServer = data.server;
+    
+    sel.value = data.server;
+    currentServer = data.server;
+    if (data.config.priority) {
+      document.getElementById('priority-select').value = data.config.priority;
+    }
 
     document.getElementById('stats-bar').innerHTML = `
       <span>${t('statServer')}: <strong>${data.server.toUpperCase()}</strong></span>
@@ -2121,6 +2170,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2132,6 +2182,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(body)
 
@@ -2208,7 +2261,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/settings":
             allowed = {}
-            for k in ("lang", "owned_dlcs", "custom_excluded", "server", "window_min"):
+            for k in ("lang", "priority", "owned_dlcs", "custom_excluded", "server", "window_min"):
                 if k in body:
                     allowed[k] = body[k]
             save_user_settings(allowed)
@@ -2228,7 +2281,7 @@ if __name__ == "__main__":
     write_pid_file()
     threading.Thread(target=idle_watchdog, daemon=True).start()
     port = CONFIG["PORT"]
-    url = f"http://127.0.0.1:{port}"
+    url = f"http://127.0.0.1:{port}/?v={APP_VERSION}"
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
