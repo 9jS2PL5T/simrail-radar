@@ -1,2 +1,2 @@
 # simrail-radar
-Live train &amp; dispatcher interaction radar with map for SimRail (PL / DE / EN)
+Real-time train finder for SimRail to maximize interactions with player trains and dispatchers (PL / DE / EN)
