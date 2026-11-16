@@ -1,6 +1,7 @@
-# 🚆 SimRail Live Radar (`v3.1.0`)
+# 🚆 SimRail Radar (`v3.1.0`)
 
-Live train & dispatcher interaction radar with an interactive map for **SimRail – The Railway Simulator** (Supports **PL / DE / EN**).
+**Train & Dispatcher Encounter Finder for SimRail – The Railway Simulator** *(PL / DE / EN)*  
+Not just another live map: **SimRail Radar** analyzes live timetables, routes, and speeds to calculate **which free AI trains will have the most real player encounters and active dispatchers** ahead of them.
 
 ---
 
