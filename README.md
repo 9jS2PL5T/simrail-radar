@@ -4,6 +4,11 @@ Live train & dispatcher interaction radar with an interactive map for **SimRail 
 
 ---
 
+<img width="1852" height="957" alt="Unbenannt" src="https://github.com/user-attachments/assets/ef6172c0-603d-44dd-8e78-bf14d790d081" />
+
+
+---
+
 ### 🇬🇧 English
 **What does it do?**
 * Finds free AI trains with the highest number of upcoming player encounters (oncoming traffic, overtaking, crossings) and active player signal boxes (dispatchers).
