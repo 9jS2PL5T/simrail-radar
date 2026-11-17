@@ -1,5 +1,7 @@
 # 🚆 SimRail Radar
 
+---
+
 **Train & Dispatcher Encounter Finder for SimRail – The Railway Simulator** *(PL / DE / EN)*  
 Not just another live map: **SimRail Radar** analyzes live timetables, routes, and speeds to calculate **which free AI trains will have the most real player encounters and active dispatchers** ahead of them.
 

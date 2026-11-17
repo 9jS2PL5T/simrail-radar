@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === SimRail Live Radar (Privat & Laufzeitdaten) ===
+_private/
+simrail_radar_config.json
+simrail_active_train.json
+simrail_radar.pid

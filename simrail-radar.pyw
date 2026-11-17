@@ -16,7 +16,7 @@ import webbrowser
 # ==============================================================================
 # VERSION & BASIS-KONFIGURATION
 # ==============================================================================
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.2.0"
 USER_AGENT = f"SimRail-Live-Radar/{APP_VERSION} (Community-Tool)"
 
 CONFIG = {
@@ -85,11 +85,15 @@ else:
 STATE_FILE = os.path.join(BASE_DIR, "simrail_active_train.json")
 USER_CONFIG_FILE = os.path.join(BASE_DIR, "simrail_radar_config.json")
 PID_FILE = os.path.join(BASE_DIR, "simrail_radar.pid")
+def get_resource_path(relative_path):
+    base = getattr(sys, "_MEIPASS", BASE_DIR)
+    return os.path.join(base, relative_path)
 
 TIMETABLE_CACHE = {}
 VENDOR_CACHE = {}
 TILE_CACHE = {}
 DIST_HISTORY = {}
+PASSED_ENCOUNTERS = {}
 CACHE_LOCK = threading.Lock()
 LAST_CLIENT_ACTIVITY = time.time()
 
@@ -477,7 +481,7 @@ def get_train_relative_route(t, timetables, max_minutes=30, server_now=None):
 
 
 def has_already_passed(
-    train_a, coords_a, dest_a, train_b, coords_b, dest_b, dist_now
+    train_a, coords_a, dest_a, train_b, coords_b, dest_b, dist_now, speed_a=0, speed_b=0
 ):
     if dist_now is None:
         return False
@@ -486,14 +490,30 @@ def has_already_passed(
     pair_key = tuple(sorted([str(train_a), str(train_b)]))
 
     with CACHE_LOCK:
+        passed_ts = PASSED_ENCOUNTERS.get(pair_key)
+        if passed_ts:
+            if (now - passed_ts) <= 1200 and dist_now < 15.0:
+                return True
+            else:
+                del PASSED_ENCOUNTERS[pair_key]
+
         prev = DIST_HISTORY.get(pair_key)
-        DIST_HISTORY[pair_key] = {"dist": dist_now, "ts": now}
+        if prev is None:
+            DIST_HISTORY[pair_key] = {"min_dist": dist_now, "last_dist": dist_now, "ts": now}
+        else:
+            min_d = min(prev["min_dist"], dist_now)
+            DIST_HISTORY[pair_key] = {"min_dist": min_d, "last_dist": dist_now, "ts": now}
+
+            if min_d < 12.0 and dist_now > (min_d + 0.12):
+                PASSED_ENCOUNTERS[pair_key] = now
+                return True
+
+            if min_d < 0.45 and dist_now < 0.45 and speed_a < 3 and speed_b < 3 and prev["last_dist"] < 0.6:
+                PASSED_ENCOUNTERS[pair_key] = now
+                return True
+
         if len(DIST_HISTORY) > 25000:
             DIST_HISTORY.clear()
-
-    if prev and (now - prev["ts"]) <= 300:
-        if prev["dist"] < 12.0 and dist_now > (prev["dist"] + 0.15):
-            return True
 
     if dist_now < 12.0 and dest_a[0] is not None and dest_b[0] is not None:
         d_a_dest = haversine_km(dest_a[0], dest_a[1], coords_b[0], coords_b[1])
@@ -504,6 +524,8 @@ def has_already_passed(
             and d_a_dest > dist_now
             and d_b_dest > dist_now
         ):
+            with CACHE_LOCK:
+                PASSED_ENCOUNTERS[pair_key] = now
             return True
 
     return False
@@ -531,6 +553,8 @@ def estimate_gps_closing(
         p_coords,
         p_dest_coords,
         dist_now,
+        b_speed,
+        p_speed,
     ):
         return None
 
@@ -604,6 +628,8 @@ def find_real_encounters_live(
             p_prof["coords"],
             p_prof["dest_coords"],
             dist_km,
+            b_speed,
+            p_prof["speed"],
         ):
             continue
 
@@ -706,25 +732,42 @@ def find_real_encounters_live(
                 live_overtake_pending = False
                 already_overtaken = False
 
+                # 1. Fahrplan-Reihenfolge am ersten gemeinsamen Punkt (first_s) prüfen:
+                # Wenn Zug p den gemeinsamen Knotenpunkt früher erreicht (p_s1 < b_s1)
+                # und am Ende des gemeinsamen Abschnitts immer noch vorne liegt (p_s2 <= b_s2),
+                # fährt er einfach voraus -> keine Überholung!
+                if p_s1 < b_s1 and p_s2 <= b_s2 + 30:
+                    already_overtaken = True
+                elif b_s1 < p_s1 and b_s2 <= p_s2 + 30:
+                    already_overtaken = True
+
+                # 2. Live-GPS-Check: Nur wenn beide Züge schon nah beieinander sind
+                # und der hintere Zug tatsächlich deutlich schneller fährt als der vordere
                 if (
-                    dist_km is not None
-                    and dist_km <= CONFIG["RADAR_FALLBACK_KM"]
+                    not already_overtaken
                     and b_to_dest is not None
                     and p_to_dest is not None
                 ):
-                    if b_speed > p_prof["speed"] + 10:
-                        if b_to_dest > p_to_dest + 0.15:
-                            live_overtake_pending = True
-                        else:
+                    if b_to_dest < p_to_dest - 0.5:
+                        # Eigener Zug (b) ist weiter vorne; nur Überholung, wenn p deutlich schneller ist
+                        if p_prof["speed"] <= b_speed + 15:
                             already_overtaken = True
-                    elif p_prof["speed"] > b_speed + 10:
-                        if p_to_dest > b_to_dest + 0.15:
+                        elif dist_km is not None and dist_km <= 8.0:
                             live_overtake_pending = True
-                        else:
+                    elif p_to_dest < b_to_dest - 0.5:
+                        # Anderer Zug (p) ist weiter vorne; nur Überholung, wenn wir (b) deutlich schneller sind
+                        if b_speed <= p_prof["speed"] + 15:
                             already_overtaken = True
+                        elif dist_km is not None and dist_km <= 8.0:
+                            live_overtake_pending = True
 
-                overtake_b_passes_p = (b_s1 >= p_s1) and (b_s2 <= p_s2)
-                overtake_p_passes_b = (p_s1 >= b_s1) and (p_s2 <= b_s2)
+                # 3. Echte Fahrplan-Überholung auf gemeinsamem Abschnitt (Reihenfolge dreht sich um)
+                both_future = (
+                    not b_dict[first_s].get("is_past_anchor")
+                    and not p_dict[first_s].get("is_past_anchor")
+                )
+                overtake_b_passes_p = both_future and (b_s1 > p_s1 + 45) and (b_s2 < p_s2 - 45)
+                overtake_p_passes_b = both_future and (p_s1 > b_s1 + 45) and (p_s2 < b_s2 - 45)
 
                 if not already_overtaken and (
                     live_overtake_pending or overtake_b_passes_p or overtake_p_passes_b
@@ -790,6 +833,7 @@ def find_real_encounters_live(
                 {
                     "train_no": p_prof["train_no"],
                     "vehicle": p_prof["vehicle"],
+                    "speed": p_prof["speed"],
                     "kind": kind,
                     "loc_mode": loc_mode,
                     "loc_a": loc_a,
@@ -896,6 +940,30 @@ def evaluate_single_train(
         own_train_no=t_no,
     )
 
+    route_coords = []
+    if t_coords[0] is not None:
+        route_coords.append({"name": cur_loc or "", "coords": t_coords, "eta_min": 0})
+
+    for p in t_points:
+        if p.get("is_past_anchor"):
+            continue
+        p_clean = p["name"].strip().lower()
+        pt_coords = station_coords_lookup.get(p_clean)
+        if not pt_coords:
+            for st_key, st_c in station_coords_lookup.items():
+                if is_same_station_or_post(st_key, p_clean):
+                    pt_coords = st_c
+                    break
+        if pt_coords and pt_coords[0] is not None:
+            if not route_coords or route_coords[-1]["coords"] != pt_coords:
+                route_coords.append(
+                    {
+                        "name": p["name"],
+                        "coords": pt_coords,
+                        "eta_min": max(1, int(round(p["rel_sec"] / 60))),
+                    }
+                )
+
     veh = train_obj.get("Vehicles", ["Unbekannt"])
     veh_name = veh[0] if veh else "Unbekannt"
 
@@ -913,6 +981,7 @@ def evaluate_single_train(
         "target": end_station,
         "speed": cur_speed,
         "coords": t_coords,
+        "route_coords": route_coords,
         "dispatched": dispatched_on_route,
         "encounters": player_encounters,
         "total_interactions": total_interactions,
@@ -1195,6 +1264,34 @@ HTML_PAGE = """<!DOCTYPE html>
       font-size: 0.74rem;
       font-weight: 600;
     }
+    .active-box, .train-card, .enc-item, .fdl-tag {
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    .map-follow-control {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 1000;
+      background: rgba(15, 23, 42, 0.92);
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .map-follow-control.active {
+      background: rgba(37, 99, 235, 0.95);
+      border-color: #60a5fa;
+      color: #ffffff;
+    }
     .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
     .window-control {
       display: flex;
@@ -1334,7 +1431,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .pill-count { background: rgba(59, 130, 246, 0.18); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.35); }
     .pill-stop { background: rgba(34, 197, 94, 0.15); color: #86efac; border: 1px solid rgba(34, 197, 94, 0.35); }
-    .pill-move { background: rgba(245, 158, 11, 0.15); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .pill-move { background: rgba(59, 130, 246, 0.18); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.35); }
 
     .route-line { font-size: 0.88rem; color: #cbd5e1; margin-bottom: 10px; }
     .detail-group { margin-top: 8px; font-size: 0.85rem; }
@@ -1475,7 +1572,12 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="section-title">
       <span id="map-title">Live-Karte</span>
     </div>
-    <div id="map"></div>
+    <div style="position:relative;">
+      <div id="map"></div>
+      <button id="btn-follow-train" class="map-follow-control" onclick="toggleFollowTrain()">
+        🎯 Zug verfolgen: AUS
+      </button>
+    </div>
     <div class="legend" id="map-legend"></div>
   </div>
 </div>
@@ -1530,7 +1632,7 @@ HTML_PAGE = """<!DOCTYPE html>
       takeTrainBtn: "Zug übernehmen",
       trainWord: "Zug",
       stopBadge: "HALT AM BAHNSTEIG (0 km/h)",
-      moveBadge: "Fährt ({v} km/h)",
+      moveBadge: "⏲️ Fährt ({v} km/h)",
       interactionsCount: "{n} Interaktionen",
       dispatchedHeader: "Stellwerke mit Spielern ({n})",
       dispatchedNone: "Stellwerke mit Spielern: Keine (nur KI)",
@@ -1602,7 +1704,7 @@ HTML_PAGE = """<!DOCTYPE html>
       takeTrainBtn: "Przejmij pociąg",
       trainWord: "Pociąg",
       stopBadge: "POSTÓJ NA STACJI (0 km/h)",
-      moveBadge: "W ruchu ({v} km/h)",
+      moveBadge: "⏲️ W ruchu ({v} km/h)",
       interactionsCount: "{n} interakcji",
       dispatchedHeader: "Nastawnie z graczami ({n})",
       dispatchedNone: "Nastawnie z graczami: Brak (tylko AI)",
@@ -1674,7 +1776,7 @@ HTML_PAGE = """<!DOCTYPE html>
       takeTrainBtn: "Take train",
       trainWord: "Train",
       stopBadge: "STOPPED AT PLATFORM (0 km/h)",
-      moveBadge: "Moving ({v} km/h)",
+      moveBadge: "⏲️ Moving ({v} km/h)",
       interactionsCount: "{n} interactions",
       dispatchedHeader: "Player Signal Boxes ({n})",
       dispatchedNone: "Player Signal Boxes: None (AI only)",
@@ -1726,6 +1828,46 @@ HTML_PAGE = """<!DOCTYPE html>
   let focusedTrain = null;
   let map = null;
   let layerGroup = null;
+  let initialMapFitted = false;
+  let isSelectingText = false;
+  let followTrain = localStorage.getItem('simrail_follow_train') === 'true';
+
+  document.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.train-card') || e.target.closest('.active-box')) {
+      isSelectingText = true;
+    }
+  });
+  document.addEventListener('mouseup', () => {
+    setTimeout(() => { isSelectingText = false; }, 50);
+  });
+
+  function updateFollowButtonUI() {
+    const btn = document.getElementById('btn-follow-train');
+    if (!btn) return;
+    const labels = {
+      de: followTrain ? '🎯 Zug verfolgen: AN' : '🎯 Zug verfolgen: AUS',
+      en: followTrain ? '🎯 Follow train: ON' : '🎯 Follow train: OFF',
+      pl: followTrain ? '🎯 Śledź pociąg: WŁ.' : '🎯 Śledź pociąg: WYŁ.'
+    };
+    btn.innerText = labels[currentLang] || labels.de;
+    btn.classList.toggle('active', followTrain);
+  }
+
+  function toggleFollowTrain() {
+    followTrain = !followTrain;
+    localStorage.setItem('simrail_follow_train', followTrain);
+    updateFollowButtonUI();
+    if (followTrain && lastPayload) {
+      centerOnTargetTrain(lastPayload);
+    }
+  }
+
+  function centerOnTargetTrain(data) {
+    const target = focusedTrain || data.active_train;
+    if (map && target && target.coords && target.coords[0] !== null) {
+      map.panTo(target.coords, { animate: true });
+    }
+  }
 
   function detectBrowserLang() {
     const nav = (navigator.language || 'en').toLowerCase();
@@ -1801,7 +1943,6 @@ HTML_PAGE = """<!DOCTYPE html>
     layerGroup = L.layerGroup().addTo(map);
   }
 
-  // Pausiert das Polling automatisch, solange der Browser-Tab im Hintergrund ist
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && autoRefresh && countdown <= 3) {
       loadData();
@@ -1812,6 +1953,8 @@ HTML_PAGE = """<!DOCTYPE html>
     if (!autoRefresh || document.hidden) return;
     countdown--;
     if (countdown <= 0) {
+      countdown = refreshIntervalSec;
+      document.getElementById('btn-auto').innerText = t('autoOn', { s: countdown });
       loadData();
     } else {
       document.getElementById('btn-auto').innerText = t('autoOn', { s: countdown });
@@ -1876,6 +2019,7 @@ HTML_PAGE = """<!DOCTYPE html>
   function changeServer() {
     currentServer = document.getElementById('server-select').value;
     focusedTrain = null;
+    initialMapFitted = false;
     loadData();
   }
 
@@ -1919,6 +2063,45 @@ HTML_PAGE = """<!DOCTYPE html>
     return t('loc_open_line', { a: e.loc_a });
   }
 
+  function getVehicleBadgeHtml(vehicleRaw) {
+    const v = (vehicleRaw || '').toLowerCase();
+    let code = 'LOK';
+    let img = 'default.png';
+    let color = '#64748b';
+    let type = 'elok';
+
+    if (v.includes('ed250') || v.includes('pendolino')) {
+      code = 'ED250'; img = 'ed250.png'; color = '#38bdf8'; type = 'emu';
+    } else if (v.includes('en57') || v.includes('en71')) {
+      code = 'EN57'; img = 'en57.png'; color = '#facc15'; type = 'emu';
+    } else if (v.includes('en76') || v.includes('elf') || v.includes('en96')) {
+      code = 'ELF'; img = 'elf.png'; color = '#4ade80'; type = 'emu';
+    } else if (v.includes('36wed') || v.includes('impuls') || v.includes('ed78')) {
+      code = '36WEd'; img = 'impuls.png'; color = '#a78bfa'; type = 'emu';
+    } else if (v.includes('eu07') || v.includes('ep07') || v.includes('ep08') || v.includes('4e')) {
+      code = 'EU07'; img = 'eu07.png'; color = '#22c55e'; type = 'elok';
+    } else if (v.includes('et22') || v.includes('201e')) {
+      code = 'ET22'; img = 'et22.png'; color = '#10b981'; type = 'elok';
+    } else if (v.includes('et25') || v.includes('dragon')) {
+      code = 'ET25'; img = 'dragon2.png'; color = '#f97316'; type = 'elok';
+    } else if (v.includes('e186') || v.includes('eu43') || v.includes('traxx')) {
+      code = v.includes('eu43') ? 'EU43' : 'E186'; img = 'traxx.png'; color = '#ef4444'; type = 'elok';
+    } else if (v.includes('163') || v.includes('persing')) {
+      code = 'ČD 163'; img = 'cd163.png'; color = '#ec4899'; type = 'elok';
+    } else if (v.includes('285') || v.includes('br285')) {
+      code = 'BR 285'; img = 'br285.png'; color = '#f59e0b'; type = 'diesel';
+    }
+
+    const svg = type === 'emu'
+      ? `<svg class="veh-fallback" width="20" height="12" viewBox="0 0 24 14" fill="none" stroke="${color}" stroke-width="1.8"><path d="M2 11h20v-4c0-2-2-4-5-4H6C3.5 3 2 5.5 2 8v3z"/><line x1="6" y1="6" x2="19" y2="6"/></svg>`
+      : `<svg class="veh-fallback" width="20" height="12" viewBox="0 0 24 14" fill="none" stroke="${color}" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="1.5"/><path d="M7 4l2-2h6l2 2"/></svg>`;
+
+    const imgTag = `<img src="/assets/${img}" alt="${code}" style="height:24px;width:56px;object-fit:cover;border-radius:3px;display:block;" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-block';" />`;
+    const svgHidden = svg.replace('<svg ', '<svg style="display:none;" ');
+
+    return `<span style="display:inline-flex;align-items:center;gap:5px;background:rgba(15,23,42,0.85);border:1px solid ${color}55;color:${color};padding:2px 6px 2px 2px;border-radius:5px;font-size:0.75rem;font-weight:700;vertical-align:middle;margin-right:5px;" title="${vehicleRaw}">${imgTag}${svgHidden}${code}</span>`;
+  }
+
   function renderTrainDetails(tr, isActiveCard) {
     const speedBadge = tr.speed === 0
       ? `<span class="pill pill-stop">${t('stopBadge')}</span>`
@@ -1943,8 +2126,9 @@ HTML_PAGE = """<!DOCTYPE html>
         const typeLabel = t('kind_' + e.kind);
         const locLabel = formatEncounterLocation(e);
         const dist = e.dist_km !== null ? ` • ${t('distAway', { d: e.dist_km })}` : '';
+        const speedInfo = e.speed !== undefined && e.speed !== null ? ` • ⏲️ ${e.speed} km/h` : '';
         return `<li class="enc-item ${oppClass}">
-          <strong>${arrow} [${typeLabel}] ${t('trainWord')} ${e.train_no}</strong> (${e.vehicle})<br/>
+          ${getVehicleBadgeHtml(e.vehicle)}<strong>${arrow} [${typeLabel}] ${t('trainWord')} ${e.train_no}</strong> (${e.vehicle})${speedInfo}<br/>
           <span class="enc-meta">${locLabel} • <strong>${t('inCaMin', { m: e.eta_min })}</strong>${dist}</span>
         </li>`;
       }).join('');
@@ -1954,6 +2138,7 @@ HTML_PAGE = """<!DOCTYPE html>
     return `
       <div class="card-header">
         <div>
+          ${getVehicleBadgeHtml(tr.vehicle)}
           <span class="train-title">${t('trainWord')} ${tr.train_no}</span>
           <span class="train-veh">| ${tr.name} (${tr.vehicle})</span>
           <div style="margin-top:4px;">${speedBadge} <span class="pill pill-count">${t('interactionsCount', { n: tr.total_interactions })}</span></div>
@@ -1967,8 +2152,13 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   function focusOnTrain(tr) {
+    const selText = window.getSelection ? window.getSelection().toString() : '';
+    if (selText.length > 0) return;
     focusedTrain = tr;
-    renderAll(lastPayload, false);
+    renderAll(lastPayload, true);
+    if (followTrain) {
+      centerOnTargetTrain(lastPayload);
+    }
   }
 
   function renderMap(data) {
@@ -2012,7 +2202,30 @@ HTML_PAGE = """<!DOCTYPE html>
       }).bindPopup(`<strong>${t('popupPlayer', { no: pl.train_no })}</strong><br/>${pl.vehicle}<br/>${t('popupTarget', { t: pl.target })} (${pl.speed} km/h)${statusLabel}`).addTo(layerGroup);
     });
 
-    // 3. Gewählter / Aktiver Zug (nur wenn explizit aktiv oder angeklickt)
+    // 3. Fahrstrecke des gewählten / aktiven Zuges einzeichnen
+    if (targetTrain && targetTrain.route_coords && targetTrain.route_coords.length >= 2) {
+      const latlngs = targetTrain.route_coords.map(r => r.coords);
+      L.polyline(latlngs, {
+        color: '#22c55e',
+        weight: 3.5,
+        opacity: 0.75,
+        dashArray: '8, 6'
+      }).addTo(layerGroup);
+
+      targetTrain.route_coords.slice(1).forEach(wp => {
+        L.circleMarker(wp.coords, {
+          radius: 3.5,
+          fillColor: '#86efac',
+          color: '#052e16',
+          weight: 1,
+          fillOpacity: 0.9
+        })
+        .bindTooltip(`${wp.name} (${t('inApproxMin', { m: wp.eta_min })})`, { direction: 'top' })
+        .addTo(layerGroup);
+      });
+    }
+
+    // 4. Gewählter / Aktiver Zug
     if (targetTrain && targetTrain.coords && targetTrain.coords[0] !== null) {
       L.circleMarker(targetTrain.coords, {
         radius: 10,
@@ -2030,12 +2243,13 @@ HTML_PAGE = """<!DOCTYPE html>
 
   function renderAll(data, skipFit = false) {
     lastPayload = data;
-    refreshIntervalSec = data.config.refresh_sec;
-    countdown = refreshIntervalSec;
+    updateFollowButtonUI();
 
-    const winInput = document.getElementById('window-input');
-    if (document.activeElement !== winInput) {
-      winInput.value = data.config.window_min;
+    const activeSelection = window.getSelection ? window.getSelection().toString() : '';
+    if (isSelectingText || activeSelection.length > 0) {
+      renderMap(data);
+      if (followTrain) centerOnTargetTrain(data);
+      return;
     }
 
     const sel = document.getElementById('server-select');
@@ -2049,9 +2263,7 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     sel.value = data.server;
     currentServer = data.server;
-    
-    sel.value = data.server;
-    currentServer = data.server;
+
     if (data.config.priority) {
       document.getElementById('priority-select').value = data.config.priority;
     }
@@ -2103,8 +2315,11 @@ HTML_PAGE = """<!DOCTYPE html>
     renderMap(data);
 
     const targetTrain = focusedTrain || data.active_train;
-    if (map && !skipFit && targetTrain && targetTrain.coords && targetTrain.coords[0] !== null) {
-      map.setView(targetTrain.coords, 9);
+    if (!initialMapFitted && map && targetTrain && targetTrain.coords && targetTrain.coords[0] !== null) {
+      map.setView(targetTrain.coords, 10);
+      initialMapFitted = true;
+    } else if (followTrain) {
+      centerOnTargetTrain(data);
     }
   }
 
@@ -2137,9 +2352,11 @@ HTML_PAGE = """<!DOCTYPE html>
           || (data.active_train && data.active_train.train_no === focusedTrain.train_no ? data.active_train : null);
         focusedTrain = updatedFocus;
       }
+      countdown = data.config.refresh_sec || refreshIntervalSec;
       renderAll(data, lastPayload !== null);
       badge.innerText = t('live');
     } catch (err) {
+      countdown = refreshIntervalSec;
       badge.innerText = t('error');
       console.error(err);
     }
@@ -2151,6 +2368,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </body>
 </html>
 """
+
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2228,6 +2446,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
             self.send_response(404)
             self.end_headers()
+
+        elif parsed.path.startswith("/assets/"):
+                    filename = os.path.basename(parsed.path)
+                    file_path = get_resource_path(os.path.join("assets", filename))
+                    if os.path.isfile(file_path):
+                        ext = os.path.splitext(filename)[1].lower()
+                        ctype = {
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".webp": "image/webp",
+                            ".svg": "image/svg+xml",
+                        }.get(ext, "application/octet-stream")
+                        with open(file_path, "rb") as f:
+                            self._send_bytes(f.read(), ctype)
+                        return
+                    self.send_response(404)
+                    self.end_headers()
 
         elif parsed.path == "/api/data":
             qs = parse_qs(parsed.query)
